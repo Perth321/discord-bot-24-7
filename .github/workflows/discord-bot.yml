@@ -8,6 +8,10 @@ on:
     - cron: '0 18 * * *'
   workflow_dispatch:
 
+concurrency:
+  group: discord-bot-singleton
+  cancel-in-progress: true
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
