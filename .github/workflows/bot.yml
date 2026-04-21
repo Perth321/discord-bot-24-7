@@ -1,0 +1,51 @@
+name: Discord Bot 24/7
+
+on:
+  # รันทุก 10 นาที เพื่อให้ bot ออนไลน์ตลอด
+  schedule:
+    - cron: '*/10 * * * *'
+  # อนุญาตให้รันด้วยมือจาก GitHub Actions tab
+  workflow_dispatch:
+  # รันเมื่อ push โค้ดใหม่
+  push:
+    branches:
+      - main
+    paths:
+      - 'bot/**'
+
+jobs:
+  run-bot:
+    name: Run Discord Bot
+    runs-on: ubuntu-latest
+    timeout-minutes: 9
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: bot/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ./bot
+        run: npm install
+
+      - name: Run Discord Bot
+        working-directory: ./bot
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          CONFIG_API_URL: ${{ secrets.CONFIG_API_URL }}
+        run: |
+          echo "Starting Discord Bot at $(date)"
+          # รัน bot นาน 8 นาที แล้วหยุด (ก่อน timeout 9 นาที)
+          # cron จะ restart ทุก 10 นาที ทำให้ bot ออนไลน์ต่อเนื่อง
+          timeout 480 node index.js || true
+          echo "Bot session ended at $(date)"
+
+      - name: Log completion
+        if: always()
+        run: echo "Bot run completed at $(date)"
