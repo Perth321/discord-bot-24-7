@@ -167,7 +167,18 @@ async function onMessage(msg) {
     return;
   }
 
-  // Auto-translate disabled — translation only triggers via !th or !vi commands
+  if (!CONFIG.translationEnabled) return;
+  if (!shouldTranslateChannel(msg.channel.id)) return;
+
+  // Auto-translate Vietnamese -> Thai only. Thai messages require explicit !th command.
+  if (VIETNAMESE_RE.test(content) && !THAI_RE.test(content)) {
+    try {
+      const out = await translate(content, "vi", "th");
+      if (out && out.trim() && out.trim().toLowerCase() !== content.trim().toLowerCase()) {
+        await msg.reply(out);
+      }
+    } catch (e) { console.error("auto vi->th:", e.message); }
+  }
 }
 
 async function onVoice(oldState, newState) {
