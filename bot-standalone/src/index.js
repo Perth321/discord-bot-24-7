@@ -1,297 +1,195 @@
-const { Client, GatewayIntentBits, EmbedBuilder } = require("discord.js");
+const { Client, GatewayIntentBits, Partials, ChannelType, Events } = require("discord.js");
 const axios = require("axios");
 
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const CONFIG_API_URL = (process.env.CONFIG_API_URL || "").replace(/\/$/, "");
+const TOKEN = process.env.DISCORD_TOKEN;
+const API = (process.env.CONFIG_API_URL || "").replace(/\/$/, "");
 
-if (!DISCORD_TOKEN) {
-  console.error("[Bot] ERROR: DISCORD_TOKEN is not set");
-  process.exit(1);
-}
+if (!TOKEN) { console.error("Missing DISCORD_TOKEN"); process.exit(1); }
+if (!API) { console.warn("WARN: CONFIG_API_URL not set — dashboard sync disabled"); }
 
-// ---- Config cache ----
-let cachedConfig = {
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMembers,
+  ],
+  partials: [Partials.Channel],
+});
+
+let CONFIG = {
   translationEnabled: true,
+  translationMode: "all",
+  translationChannelIds: [],
   voiceChannelIds: [],
   notificationChannelId: null,
 };
 
-async function fetchConfig() {
-  if (!CONFIG_API_URL) return;
+async function refreshConfig() {
+  if (!API) return;
   try {
-    const res = await axios.get(`${CONFIG_API_URL}/api/config`, {
-      timeout: 8000,
-    });
-    cachedConfig = res.data;
-    console.log("[Config] Loaded:", JSON.stringify(cachedConfig));
-  } catch (err) {
-    console.warn("[Config] Failed to fetch, using cached:", err.message);
+    const { data } = await axios.get(`${API}/api/config`, { timeout: 8000 });
+    CONFIG = { ...CONFIG, ...data };
+  } catch (e) {
+    console.error("refreshConfig failed:", e.message);
   }
 }
 
-// Refresh config every 5 minutes
-setInterval(fetchConfig, 5 * 60 * 1000);
-
-// ---- Heartbeat — reports bot status to Replit dashboard API ----
-async function sendHeartbeat(client) {
-  if (!CONFIG_API_URL) return;
+async function syncChannels() {
+  if (!API) return;
   try {
-    await axios.post(
-      `${CONFIG_API_URL}/api/bot/heartbeat`,
-      {
-        tag: client?.user?.tag || null,
-        uptime: client?.uptime || null,
-      },
-      { timeout: 8000 }
-    );
-  } catch (err) {
-    console.warn("[Heartbeat] Failed:", err.message);
+    const channels = [];
+    for (const [, guild] of client.guilds.cache) {
+      for (const [, ch] of guild.channels.cache) {
+        let type = null;
+        if (ch.type === ChannelType.GuildText) type = "text";
+        else if (ch.type === ChannelType.GuildVoice) type = "voice";
+        if (!type) continue;
+        channels.push({ id: ch.id, guildId: guild.id, guildName: guild.name, name: ch.name, type });
+      }
+    }
+    await axios.post(`${API}/api/channels/sync`, { channels }, { timeout: 15000 });
+    console.log(`synced ${channels.length} channels`);
+  } catch (e) {
+    console.error("syncChannels failed:", e.message);
   }
 }
 
-// ---- Translation (Google Translate unofficial — unlimited, no key) ----
-async function translate(text, from, to) {
+async function heartbeat() {
+  if (!API) return;
   try {
-    const url = "https://translate.googleapis.com/translate_a/single";
-    const res = await axios.get(url, {
-      params: {
-        client: "gtx",
-        sl: from,
-        tl: to,
-        dt: "t",
-        q: text,
-      },
-      timeout: 10000,
-    });
-    const data = res.data;
-    if (Array.isArray(data) && Array.isArray(data[0])) {
-      return data[0].map((part) => part[0]).join("") || null;
-    }
-    return null;
-  } catch (err) {
-    console.warn("[Translate] Error:", err.message);
-    // Fallback to MyMemory
-    try {
-      const fb = await axios.get("https://api.mymemory.translated.net/get", {
-        params: { q: text, langpair: `${from}|${to}` },
-        timeout: 8000,
-      });
-      if (fb.data?.responseStatus === 200) {
-        return fb.data.responseData.translatedText || null;
-      }
-    } catch (_) {}
-    return null;
+    await axios.post(`${API}/api/bot/heartbeat`, {
+      tag: client.user?.tag ?? null,
+      uptime: client.uptime ?? 0,
+    }, { timeout: 8000 });
+  } catch (e) {
+    console.error("heartbeat failed:", e.message);
   }
 }
 
-// ---- Vietnamese detection ----
-function isVietnamese(text) {
-  return /[àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ]/i.test(
-    text
-  );
+// Free Google translate endpoint (no key needed)
+async function translate(text, source, target) {
+  const url = "https://translate.googleapis.com/translate_a/single";
+  const { data } = await axios.get(url, {
+    params: { client: "gtx", sl: source, tl: target, dt: "t", q: text },
+    timeout: 10000,
+  });
+  if (!Array.isArray(data) || !Array.isArray(data[0])) return null;
+  return data[0].map((seg) => seg[0]).join("");
 }
 
-// ---- Discord client ----
-const allIntents = [
-  GatewayIntentBits.Guilds,
-  GatewayIntentBits.GuildMessages,
-  GatewayIntentBits.MessageContent,
-  GatewayIntentBits.GuildVoiceStates,
-];
+// Detect Vietnamese: contains Vietnamese-specific diacritics
+const VIETNAMESE_RE = /[ăâđêôơưĂÂĐÊÔƠƯáàảãạắằẳẵặấầẩẫậéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵÁÀẢÃẠẮẰẲẴẶẤẦẨẪẬÉÈẺẼẸẾỀỂỄỆÍÌỈĨỊÓÒỎÕỌỐỒỔỖỘỚỜỞỠỢÚÙỦŨỤỨỪỬỮỰÝỲỶỸỴ]/;
+const THAI_RE = /[\u0E00-\u0E7F]/;
 
-const voiceOnlyIntents = [
-  GatewayIntentBits.Guilds,
-  GatewayIntentBits.GuildVoiceStates,
-];
-
-let messageContentEnabled = false;
-
-function createClient(intents) {
-  const client = new Client({ intents });
-
-  client.once("clientReady", async () => {
-    console.log(`[Bot] Online as ${client.user.tag}`);
-    console.log(`[Bot] Message content: ${messageContentEnabled}`);
-    if (!messageContentEnabled) {
-      console.warn(
-        "[Bot] Translation disabled — enable Message Content Intent at: " +
-          "https://discord.com/developers/applications → Bot → Privileged Gateway Intents"
-      );
-    }
-    await fetchConfig();
-    await sendHeartbeat(client);
-    // Send heartbeat every 60 seconds
-    setInterval(() => sendHeartbeat(client), 60 * 1000);
-  });
-
-  client.on("messageCreate", async (message) => {
-    try {
-      if (message.author.bot) return;
-      if (!messageContentEnabled) return;
-
-      const content = message.content.trim();
-
-      // !th <text> — แปลไทย→เวียดนาม
-      if (content.toLowerCase().startsWith("!th ")) {
-        const text = content.slice(4).trim();
-        if (!text) return;
-        const translated = await translate(text, "th", "vi");
-        const embed = new EmbedBuilder()
-          .setColor(0x5865f2)
-          .setTitle("แปลภาษา: ไทย → เวียดนาม")
-          .addFields(
-            { name: "ต้นฉบับ (ไทย)", value: text },
-            { name: "แปลแล้ว (เวียดนาม)", value: translated || "แปลไม่ได้ในขณะนี้" }
-          )
-          .setFooter({ text: "Powered by Google Translate" })
-          .setTimestamp();
-        await message.reply({ embeds: [embed] });
-        return;
-      }
-
-      // !vi <text> — แปลเวียดนาม→ไทย
-      if (content.toLowerCase().startsWith("!vi ")) {
-        const text = content.slice(4).trim();
-        if (!text) return;
-        const translated = await translate(text, "vi", "th");
-        const embed = new EmbedBuilder()
-          .setColor(0x5865f2)
-          .setTitle("แปลภาษา: เวียดนาม → ไทย")
-          .addFields(
-            { name: "ต้นฉบับ (เวียดนาม)", value: text },
-            { name: "แปลแล้ว (ไทย)", value: translated || "แปลไม่ได้ในขณะนี้" }
-          )
-          .setFooter({ text: "Powered by Google Translate" })
-          .setTimestamp();
-        await message.reply({ embeds: [embed] });
-        return;
-      }
-
-      // !help
-      if (content.toLowerCase() === "!help") {
-        const embed = new EmbedBuilder()
-          .setColor(0x5865f2)
-          .setTitle("คำสั่งบอท")
-          .addFields(
-            { name: "!th <ข้อความ>", value: "แปลภาษาไทยเป็นเวียดนาม" },
-            { name: "!vi <ข้อความ>", value: "แปลภาษาเวียดนามเป็นไทย" },
-            { name: "แปลอัตโนมัติ", value: "บอทตรวจจับภาษาเวียดนามและแปลเป็นไทยอัตโนมัติ" }
-          );
-        await message.reply({ embeds: [embed] });
-        return;
-      }
-
-      // Auto-detect Vietnamese → translate to Thai
-      if (content.startsWith("!")) return;
-      if (!cachedConfig.translationEnabled) return;
-      if (content.length < 3) return;
-
-      if (isVietnamese(content)) {
-        const translated = await translate(content, "vi", "th");
-        if (!translated) return;
-        const embed = new EmbedBuilder()
-          .setColor(0x00b894)
-          .setTitle("ตรวจพบภาษาเวียดนาม")
-          .addFields(
-            { name: "ต้นฉบับ (เวียดนาม)", value: content },
-            { name: "แปลแล้ว (ไทย)", value: translated }
-          )
-          .setAuthor({
-            name: message.author.displayName || message.author.username,
-            iconURL: message.author.displayAvatarURL(),
-          })
-          .setFooter({ text: "Powered by Google Translate" })
-          .setTimestamp();
-        await message.reply({ embeds: [embed] });
-      }
-    } catch (err) {
-      console.error("[Bot] messageCreate error:", err.message);
-    }
-  });
-
-  client.on("voiceStateUpdate", async (oldState, newState) => {
-    try {
-      const notifChannelId = cachedConfig.notificationChannelId;
-      if (!notifChannelId) return;
-
-      const notifChannel = client.channels.cache.get(notifChannelId);
-      if (!notifChannel || !notifChannel.isTextBased()) return;
-
-      const member = newState.member || oldState.member;
-      const memberName = member?.displayName || member?.user.username || "Unknown";
-      const memberAvatar = member?.user.displayAvatarURL() || null;
-      const monitored = cachedConfig.voiceChannelIds || [];
-
-      if (!oldState.channelId && newState.channelId) {
-        const ch = newState.channel;
-        if (!ch) return;
-        if (monitored.length > 0 && !monitored.includes(newState.channelId)) return;
-
-        const embed = new EmbedBuilder()
-          .setColor(0x00b894)
-          .setTitle("เข้าร่วม Voice Channel")
-          .setDescription(`**${memberName}** เข้าร่วม **${ch.name}**`)
-          .addFields(
-            { name: "สมาชิก", value: memberName, inline: true },
-            { name: "ห้อง", value: ch.name, inline: true },
-            { name: "เวลา", value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
-          )
-          .setTimestamp();
-        if (memberAvatar) embed.setThumbnail(memberAvatar);
-        await notifChannel.send({ embeds: [embed] });
-      } else if (oldState.channelId && !newState.channelId) {
-        const ch = oldState.channel;
-        if (!ch) return;
-        if (monitored.length > 0 && !monitored.includes(oldState.channelId)) return;
-
-        const embed = new EmbedBuilder()
-          .setColor(0xff7675)
-          .setTitle("ออกจาก Voice Channel")
-          .setDescription(`**${memberName}** ออกจาก **${ch.name}**`)
-          .addFields(
-            { name: "สมาชิก", value: memberName, inline: true },
-            { name: "ห้อง", value: ch.name, inline: true },
-            { name: "เวลา", value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
-          )
-          .setTimestamp();
-        if (memberAvatar) embed.setThumbnail(memberAvatar);
-        await notifChannel.send({ embeds: [embed] });
-      }
-    } catch (err) {
-      console.error("[Bot] voiceStateUpdate error:", err.message);
-    }
-  });
-
-  client.on("error", (err) => {
-    console.error("[Bot] Client error:", err.message);
-  });
-
-  client.on("disconnect", () => {
-    console.warn("[Bot] Disconnected, will reconnect...");
-  });
-
-  return client;
-}
-
-async function login() {
-  // Try with MessageContent first
-  try {
-    messageContentEnabled = true;
-    const client = createClient(allIntents);
-    await client.login(DISCORD_TOKEN);
-  } catch (err) {
-    if (err.message && err.message.includes("disallowed intents")) {
-      console.warn("[Bot] MessageContent intent not enabled, retrying without...");
-      messageContentEnabled = false;
-      const client = createClient(voiceOnlyIntents);
-      await client.login(DISCORD_TOKEN);
-    } else {
-      throw err;
-    }
+function shouldTranslateChannel(channelId) {
+  if (CONFIG.translationMode === "selected") {
+    return Array.isArray(CONFIG.translationChannelIds) && CONFIG.translationChannelIds.includes(channelId);
   }
+  return true;
 }
 
-login().catch((err) => {
-  console.error("[Bot] Fatal login error:", err.message);
-  process.exit(1);
+client.once(Events.ClientReady, async (c) => {
+  console.log(`Logged in as ${c.user.tag}`);
+  await refreshConfig();
+  await syncChannels();
+  await heartbeat();
+  setInterval(refreshConfig, 60_000);
+  setInterval(syncChannels, 5 * 60_000);
+  setInterval(heartbeat, 30_000);
 });
+
+client.on(Events.GuildCreate, () => syncChannels());
+client.on(Events.ChannelCreate, () => syncChannels());
+client.on(Events.ChannelDelete, () => syncChannels());
+client.on(Events.ChannelUpdate, () => syncChannels());
+
+client.on(Events.MessageCreate, async (msg) => {
+  if (msg.author.bot || !msg.guild) return;
+  const content = msg.content?.trim();
+  if (!content) return;
+
+  // !th command: TH -> VI
+  if (content.toLowerCase().startsWith("!th")) {
+    if (!CONFIG.translationEnabled) return;
+    const text = content.slice(3).trim();
+    if (!text) {
+      await msg.reply("ใช้: `!th <ข้อความภาษาไทย>` เพื่อแปลเป็นภาษาเวียดนาม").catch(() => {});
+      return;
+    }
+    try {
+      const out = await translate(text, "th", "vi");
+      if (out) await msg.reply(`🇻🇳 ${out}`);
+    } catch (e) {
+      console.error("!th translate error:", e.message);
+      await msg.reply("แปลไม่สำเร็จ ลองใหม่อีกครั้ง").catch(() => {});
+    }
+    return;
+  }
+
+  if (!CONFIG.translationEnabled) return;
+  if (!shouldTranslateChannel(msg.channel.id)) return;
+
+  // Auto: VI -> TH
+  if (VIETNAMESE_RE.test(content) && !THAI_RE.test(content)) {
+    try {
+      const out = await translate(content, "vi", "th");
+      if (out && out.trim() && out.trim().toLowerCase() !== content.trim().toLowerCase()) {
+        await msg.reply(`🇹🇭 ${out}`);
+      }
+    } catch (e) {
+      console.error("auto vi->th error:", e.message);
+    }
+  }
+});
+
+client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
+  try {
+    const notifId = CONFIG.notificationChannelId;
+    if (!notifId) return;
+    const watchList = Array.isArray(CONFIG.voiceChannelIds) ? CONFIG.voiceChannelIds : [];
+    const allChannels = watchList.length === 0;
+
+    const member = newState.member || oldState.member;
+    const userTag = member?.displayName || member?.user?.username || "Someone";
+
+    let event = null;
+    let channel = null;
+    if (!oldState.channelId && newState.channelId) {
+      event = "join";
+      channel = newState.channel;
+    } else if (oldState.channelId && !newState.channelId) {
+      event = "leave";
+      channel = oldState.channel;
+    } else if (oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId) {
+      event = "move";
+      channel = newState.channel;
+    }
+    if (!event || !channel) return;
+    if (!allChannels && !watchList.includes(channel.id)) {
+      // Also check old channel for leave/move
+      if (event === "leave" || event === "move") {
+        if (!watchList.includes(oldState.channelId)) return;
+      } else return;
+    }
+
+    const guild = newState.guild || oldState.guild;
+    const target = await guild.channels.fetch(notifId).catch(() => null);
+    if (!target || !target.isTextBased()) return;
+
+    let text;
+    if (event === "join") text = `🟢 **${userTag}** เข้าห้อง 🔊 **${channel.name}**`;
+    else if (event === "leave") text = `🔴 **${userTag}** ออกจากห้อง 🔊 **${channel.name}**`;
+    else text = `🔄 **${userTag}** ย้ายจาก 🔊 **${oldState.channel?.name ?? "?"}** → 🔊 **${newState.channel?.name ?? "?"}**`;
+
+    await target.send(text).catch(() => {});
+  } catch (e) {
+    console.error("voiceStateUpdate error:", e.message);
+  }
+});
+
+client.on("error", (e) => console.error("client error:", e.message));
+process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e?.message || e));
+
+client.login(TOKEN);
