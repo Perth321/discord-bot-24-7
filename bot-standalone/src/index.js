@@ -45,13 +45,18 @@ function applyEnvOverrides() {
   }
 }
 
+let LAST_RAW_CONFIG = null;
+let LAST_CONFIG_ERROR = null;
 async function refreshConfig() {
   if (!API) { applyEnvOverrides(); return; }
   try {
     const { data } = await axios.get(`${API}/api/config`, { timeout: 8000 });
+    LAST_RAW_CONFIG = data;
+    LAST_CONFIG_ERROR = null;
     CONFIG = { ...CONFIG, ...data };
     applyEnvOverrides();
   } catch (e) {
+    LAST_CONFIG_ERROR = e.message;
     console.error("refreshConfig:", e.message);
     applyEnvOverrides();
   }
@@ -141,6 +146,27 @@ async function onMessage(msg) {
     return;
   }
 
+  if (content.toLowerCase() === "!status") {
+    const here = msg.channel.id;
+    const willTranslate = CONFIG.translationEnabled && shouldTranslateChannel(here);
+    const lines = [
+      "```",
+      `messageContentOk: ${MESSAGE_CONTENT_OK}`,
+      `translationEnabled: ${CONFIG.translationEnabled}`,
+      `translationMode: ${CONFIG.translationMode}`,
+      `translationChannelIds: ${JSON.stringify(CONFIG.translationChannelIds || [])}`,
+      `currentChannelId: ${here}`,
+      `willTranslateHere: ${willTranslate}`,
+      `notificationChannelId: ${CONFIG.notificationChannelId || "(none)"}`,
+      `voiceChannelIds: ${JSON.stringify(CONFIG.voiceChannelIds || [])}`,
+      `apiConfigured: ${!!API}`,
+      `lastConfigError: ${LAST_CONFIG_ERROR || "(none)"}`,
+      "```",
+    ];
+    await msg.reply(lines.join("\n")).catch(() => {});
+    return;
+  }
+
   if (!CONFIG.translationEnabled) return;
   if (!shouldTranslateChannel(msg.channel.id)) return;
 
@@ -215,13 +241,17 @@ function attachHandlers(c) {
     console.log(`Logged in as ${ready.user.tag} (messageContent=${MESSAGE_CONTENT_OK})`);
     console.log(`guilds: ${c.guilds.cache.size}`);
     await refreshConfig();
-    console.log("CONFIG:", JSON.stringify({
+    console.log("RAW_CONFIG_FROM_API:", JSON.stringify(LAST_RAW_CONFIG));
+    console.log("CONFIG (after env overrides):", JSON.stringify({
       translationEnabled: CONFIG.translationEnabled,
       translationMode: CONFIG.translationMode,
-      translationChannels: CONFIG.translationChannelIds?.length || 0,
+      translationChannelIds: CONFIG.translationChannelIds,
       notificationChannelId: CONFIG.notificationChannelId,
-      voiceChannels: CONFIG.voiceChannelIds?.length || 0,
+      voiceChannelIds: CONFIG.voiceChannelIds,
     }));
+    if (CONFIG.translationMode === "selected" && (!CONFIG.translationChannelIds || CONFIG.translationChannelIds.length === 0)) {
+      console.warn("⚠️  translationMode=selected but translationChannelIds is empty — bot will NEVER auto-translate. Either set TRANSLATION_MODE=all secret, or add channels in dashboard.");
+    }
     if (!CONFIG.notificationChannelId) {
       console.warn("⚠️  notificationChannelId is empty — voice notifications will NOT be sent. Set the NOTIFICATION_CHANNEL_ID GitHub secret to a Discord text channel ID.");
     }
